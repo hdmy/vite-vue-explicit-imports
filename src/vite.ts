@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { isAbsolute, resolve } from 'pathe'
 import type { Plugin, ResolvedConfig } from 'vite'
 import { analyzeFile } from './analyze'
@@ -7,7 +7,23 @@ import { loadRegistry } from './registry'
 import type { Registry } from './registry'
 import { countFindings, formatFileLine, mergeReport, reportPath, writeReport } from './report'
 import { normalizeViteAliases } from './run'
+import { CATEGORIES } from './types'
 import type { ExplicitImportsOptions, Finding, Report } from './types'
+
+function existingFindings(file: string): Finding[] {
+  if (!existsSync(file)) return []
+  try {
+    const saved = JSON.parse(readFileSync(file, 'utf8'))
+    if (saved?.version !== 1 || !Array.isArray(saved.findings)) return []
+    return saved.findings.filter((finding: Finding) => finding && typeof finding.file === 'string'
+      && Number.isInteger(finding.line) && Number.isInteger(finding.column)
+      && CATEGORIES.includes(finding.category) && ['import', 'type', 'component', 'directive'].includes(finding.kind)
+      && typeof finding.name === 'string' && typeof finding.suggestion === 'string' && typeof finding.fixable === 'boolean'
+      && (finding.reason === undefined || typeof finding.reason === 'string'))
+  } catch {
+    return []
+  }
+}
 
 export function explicitImports(options: ExplicitImportsOptions = {}): Plugin {
   let project: Project
@@ -39,6 +55,12 @@ export function explicitImports(options: ExplicitImportsOptions = {}): Plugin {
     timer.unref()
   }
 
+  function forget(file: string): void {
+    warned.delete(file)
+    buildWarnings.delete(file)
+    if (output && report.findings.some(finding => finding.file === file)) update(file, [])
+  }
+
   function finish(): void {
     flush()
     if (report?.source !== 'build' || summarized) return
@@ -57,24 +79,22 @@ export function explicitImports(options: ExplicitImportsOptions = {}): Plugin {
       project = new Project({ ...options, root, alias: { ...normalizeViteAliases(config.resolve.alias, config.root), ...options.alias } })
       registry = loadRegistry(project)
       log = config.logger
+      output = options.report === false ? undefined : reportPath(root, typeof options.report === 'string' ? options.report : undefined)
       report = {
         version: 1, generatedAt: new Date().toISOString(), source: config.command === 'build' ? 'build' : 'dev',
-        modes: project.modes, findings: [],
+        modes: project.modes, findings: output ? existingFindings(output) : [],
       }
-      output = options.report === false ? undefined : reportPath(root, typeof options.report === 'string' ? options.report : undefined)
-      dirty = !!output
+      dirty = false
       summarized = false
       warned.clear()
       buildWarnings.clear()
     },
     configureServer(server) {
-      server.watcher.on('unlink', path => {
-        const file = resolve(path)
-        if (!project.includes(file)) return
-        warned.delete(file)
-        update(file, [])
-      })
+      server.watcher.on('unlink', path => forget(resolve(path)))
       server.httpServer?.once('close', flush)
+    },
+    watchChange(id, { event }) {
+      if (event === 'delete') forget(resolve(id))
     },
     buildStart() {
       summarized = false
@@ -88,9 +108,7 @@ export function explicitImports(options: ExplicitImportsOptions = {}): Plugin {
         source = readFileSync(file, 'utf8')
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-        warned.delete(file)
-        buildWarnings.delete(file)
-        update(file, [])
+        forget(file)
         return
       }
       const { findings } = analyzeFile(file, source, project, registry)

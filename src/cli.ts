@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { cac } from 'cac'
 import { relative } from 'pathe'
+import pkg from '../package.json'
 import { countFindings, formatFileLine } from './report'
 import { check, migrate, openSession } from './run'
 import type { SessionOptions } from './run'
@@ -10,21 +11,23 @@ import type { Category, Mode } from './types'
 interface Flags {
   root?: string
   config?: string
-  category?: string
+  category?: string | string[]
   importsDts?: string
   componentsDts?: string
   unimportItems?: string
-  ignoreImports?: string
-  ignoreComponents?: string
-  ignoreDirectives?: string
-  exclude?: string
+  ignoreImports?: string | string[]
+  ignoreComponents?: string | string[]
+  ignoreDirectives?: string | string[]
+  exclude?: string | string[]
   report?: boolean | string
   json?: boolean
   dryRun?: boolean
 }
 
 const cli = cac('vite-vue-explicit-imports')
-const split = (value?: string) => value?.split(',').map(item => item.trim()).filter(Boolean)
+const split = (value?: string | string[]) => value === undefined
+  ? undefined
+  : [value].flat().flatMap(item => item.split(',')).map(item => item.trim()).filter(Boolean)
 const print = (line: string) => process.stdout.write(line + '\n')
 
 cli.option('--root <dir>', 'Project root')
@@ -98,6 +101,7 @@ cli.command('migrate [...paths]', 'Insert explicit imports and report manual wor
   })
 
 cli.help()
+cli.version(pkg.version)
 
 try {
   // CAC consumes the next positional argument after a bare boolean flag.
@@ -108,7 +112,7 @@ try {
   }
   cli.parse(argv, { run: false })
   if (cli.matchedCommand) await cli.runMatchedCommand()
-  else if (!cli.options.help) {
+  else if (!cli.options.help && !cli.options.version) {
     if (cli.args.length) throw new Error(`Unknown command "${cli.args[0]}". Use --help to list commands.`)
     cli.outputHelp()
   }

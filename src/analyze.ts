@@ -191,7 +191,11 @@ export function analyzeFile(file: string, source: string, project: Project, regi
   if (sfc?.errors.length) return analysis
   const descriptor = sfc?.descriptor
 
-  const parseBlock = (block: SFCDescriptor['script']) => block && !block.src
+  const selfClosing = (block: SFCDescriptor['script']) => !!block
+    && block.loc.start.offset === block.loc.end.offset
+    && source.slice(block.loc.start.offset - 2, block.loc.start.offset) === '/>'
+  const selfClosingSetup = selfClosing(descriptor?.scriptSetup ?? null)
+  const parseBlock = (block: SFCDescriptor['script']) => block && !block.src && !selfClosing(block)
     && ['js', 'jsx', 'ts', 'tsx'].includes(block.lang ?? 'js')
     ? parseScript(block.content, `${file}.${block.lang ?? 'js'}`, block.loc.start.offset)
     : undefined
@@ -257,10 +261,7 @@ export function analyzeFile(file: string, source: string, project: Project, regi
           || (query && block?.scope.getDeclaration(node.name, { mode: 'type' }) instanceof ScopeTrackerImport)
         if (declared(script) || (script === setup && declared(normal))) return
 
-        // A declaration in the other namespace can make a new import illegal or change its meaning.
-        const collision = scripts.some(block => block.scope.isDeclared(node.name, { mode: 'all' }))
-        const reason = collision ? 'An existing top-level binding uses this import name.'
-          : (!typeOnly || query) && entry.type ? 'The registry exposes this name only as a type.'
+        const reason = (!typeOnly || query) && entry.type ? 'The registry exposes this name only as a type.'
           : !typeOnly && /\.(?:cts|cjs)$/.test(file) ? 'A CommonJS file requires a manual runtime import.'
           : undefined
         add(entry, 'imports', script.target.start + node.start, typeOnly, script.target, reason)
@@ -284,7 +285,9 @@ export function analyzeFile(file: string, source: string, project: Project, regi
       const options = !descriptor.scriptSetup && normal ? optionsObject(normal.target.program) : undefined
       const registeredComponents = optionRegistry(options, 'components')
       const registeredDirectives = optionRegistry(options, 'directives')
-      const unavailable = hasScript && !setup ? 'This template requires a manual Options API binding.' : undefined
+      const unavailable = selfClosingSetup ? 'Expand the self-closing <script setup /> before adding imports.'
+        : hasScript && !setup ? 'This template requires a manual Options API binding.' : undefined
+      const unavailableComponent = selfClosingSetup ? unavailable : 'Could not safely edit the Options API components registry.'
       const templateOffset = template.loc.start.offset
       const visit = (value: unknown): void => {
         if (Array.isArray(value)) {
@@ -323,7 +326,7 @@ export function analyzeFile(file: string, source: string, project: Project, regi
               normal.target.registration ??= { options, components: registeredComponents.object, names: [] }
             }
             add(entry, 'components', offset + 1, false, setup?.target ?? (canRegister ? normal.target : undefined),
-              hasScript && !setup && !canRegister ? 'Could not safely edit the Options API components registry.' : undefined,
+              hasScript && !setup && !canRegister ? unavailableComponent : undefined,
               canRegister ? entry.local : undefined, reuse)
           }
         }

@@ -14,9 +14,6 @@ importers:
       cac:
         specifier: ^6.7.14
         version: 6.7.14
-      consola:
-        specifier: ^3.4.0
-        version: 3.4.2
       magic-string:
         specifier: ^0.30.0
         version: 0.30.21
@@ -554,10 +551,6 @@ packages:
   chai@6.3.0:
     resolution: {integrity: sha512-XWAtwJ6OHO+tj0EKCs0Y2UamnyOxseZWltU4x2U2wh8g4AigdjwvtUjvLP2tqkA/avxHEtzxNaqGq/YGNwckKg==}
     engines: {node: '>=18'}
-
-  consola@3.4.2:
-    resolution: {integrity: sha512-5IKcdX0nnYavi6G7TtOhwkYzyjfJlatbjMjuLSfE2kYT5pMDOilZ4OvMhi637CcDICTmz3wARPoyhqyX1Y+XvA==}
-    engines: {node: ^14.18.0 || >=16.10.0}
 
   convert-source-map@2.0.0:
     resolution: {integrity: sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==}
@@ -1329,8 +1322,6 @@ snapshots:
   cac@7.1.0: {}
 
   chai@6.3.0: {}
-
-  consola@3.4.2: {}
 
   convert-source-map@2.0.0: {}
 

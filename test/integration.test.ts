@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { resolve } from 'pathe'
 import { build, createLogger, createServer } from 'vite'
+import pkg from '../package.json'
 import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 import { check, explicitImports, mergeReport, migrate, openSession } from '../src/index'
 import type { Finding, Report } from '../src/index'
@@ -128,6 +129,83 @@ describe('Vite plugin', () => {
     }
   })
 
+  test('merges a transformed file into a prior report and keeps findings from unvisited files', async () => {
+    const root = createProject({ 'src/entry.js': 'export const value = ref(1)' })
+    const initial = check(await openSession({ root })).report
+    const entry = resolve(root, 'src/entry.js')
+    writeFileSync(entry, '// Moved down a line\nexport const value = ref(1)')
+    const server = await createServer({
+      root, configFile: false, logLevel: 'silent', server: { middlewareMode: true, ws: false },
+      plugins: [explicitImports()],
+    })
+    try {
+      await server.transformRequest('/src/entry.js')
+      await vi.waitFor(() => expect(readReport(root)).toMatchObject({
+        source: 'dev', findings: initial.findings.map(finding => finding.file === entry ? { ...finding, line: 2 } : finding),
+      }))
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('leaves the existing report byte-for-byte when closing without a transform', async () => {
+    const root = createProject()
+    const { reportFile } = check(await openSession({ root }))
+    const original = readFileSync(reportFile!, 'utf8')
+    const server = await createServer({
+      root, configFile: false, logLevel: 'silent', server: { middlewareMode: true, ws: false },
+      plugins: [explicitImports()],
+    })
+    await server.close()
+    expect(readFileSync(reportFile!, 'utf8')).toBe(original)
+  })
+
+  test('ignores malformed report JSON and writes valid findings after a transform', async () => {
+    const root = createProject({ 'src/entry.js': 'export const value = ref(1)' })
+    writeFileSync(resolve(root, '.explicit-imports-report.json'), '{"version":1')
+    await build({
+      root, configFile: false, logLevel: 'silent',
+      plugins: [explicitImports()],
+      build: { write: false, rollupOptions: { input: resolve(root, 'src/entry.js') } },
+    })
+    expect(readReport(root)).toMatchObject({ source: 'build', findings: [{ name: 'ref' }] })
+  })
+
+  test('removes a deleted file from the watch report and build warning summary', async () => {
+    const root = createProject({
+      'src/entry.js': "import './deleted.js'\nexport const value = ref(0)",
+      'src/deleted.js': 'ref(1)',
+    })
+    const deleted = resolve(root, 'src/deleted.js')
+    const logger = createLogger('silent')
+    const warn = vi.spyOn(logger, 'warn')
+    const plugin = explicitImports()
+    const watchChange = plugin.watchChange
+    if (typeof watchChange !== 'function') throw new Error('Expected a watchChange hook')
+    await build({
+      root, configFile: false, customLogger: logger,
+      plugins: [{
+        name: 'simulate-watch-delete',
+        enforce: 'pre',
+        buildEnd: {
+          order: 'pre',
+          sequential: true,
+          async handler() {
+            rmSync(deleted)
+            await watchChange.call(this, deleted, { event: 'delete' })
+          },
+        },
+      }, plugin],
+      build: { write: false, rollupOptions: { input: resolve(root, 'src/entry.js') } },
+    })
+    const messages = warn.mock.calls.map(([message]) => message)
+    expect(messages.some(message => message.includes('src/deleted.js:'))).toBe(true)
+    expect(messages.filter(message => message.includes('finding(s)'))).toEqual([
+      '[explicit-imports] 1 finding(s) (1 imports, 0 components, 0 directives).',
+    ])
+    expect(readReport(root).findings.map(finding => finding.file)).toEqual([resolve(root, 'src/entry.js')])
+  })
+
   test('fails a strict build with a file location, suggestion and migration hint', async () => {
     const root = createProject({ 'src/entry.js': 'export const value = ref(1)' })
     await expect(build({
@@ -186,6 +264,26 @@ describe('built CLI', () => {
     const invalid = invoke(root, 'check', '--category', 'wrong')
     expect(invalid.status).toBe(2)
     expect(invalid.stderr).toContain('Invalid category')
+  })
+
+  test('accepts repeated list flags alongside comma-separated values', () => {
+    const root = createProject({
+      [views]: '<template><div v-loading v-focus v-visible v-other /></template>',
+      'components.d.ts': "declare module 'vue' { interface GlobalDirectives {"
+        + ['Loading', 'Focus', 'Visible', 'Other'].map(name => "v" + name + ": typeof import('directives').v" + name).join(';')
+        + '} }',
+    })
+    const result = invoke(root, 'check', '--category', 'directives', '--no-report', '--json',
+      '--ignore-directives', 'loading,visible', '--ignore-directives', 'focus', views)
+    expect(result.status).toBe(1)
+    expect(JSON.parse(result.stdout).findings.map((finding: Finding) => finding.name)).toEqual(['other'])
+  })
+
+  test('prints the package version without help text', () => {
+    const result = invoke(createProject(), '--version')
+    expect(result.status).toBe(0)
+    expect(result.stderr).toBe('')
+    expect(result.stdout.trim().split('\n')).toEqual([expect.stringContaining('vite-vue-explicit-imports/' + pkg.version)])
   })
 
   test('dry-runs migrations then writes changes and exits clean on a new check', () => {

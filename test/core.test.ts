@@ -391,3 +391,29 @@ test('does not treat inline import type qualifiers as implicit imports', () => {
   const source = "type A = import('vue').VueRef\ntype B = typeof import('vue').ref\ntype C = import('vue').VueRef.Foo"
   expect(migrate('src/Inline.ts', source).findings).toEqual([])
 })
+
+test.each([
+  ['function demo() { const VueRef = 1; type T = VueRef; return VueRef }', 'VueRef', "import type { Ref as VueRef } from 'vue'"],
+  ['function helper() { type ref = number; return ref(1) }', 'ref', "import { ref } from 'vue'"],
+])('imports names shadowed only in the opposite inner namespace %#', (source, name, statement) => {
+  const { findings, output } = migrate('src/Shadow.ts', source)
+  expect(findings).toHaveLength(1)
+  expect(findings[0]).toMatchObject({ name, fixable: true })
+  expect(output).toBe(statement + '\n' + source)
+})
+
+test('leaves a real top-level opposite-namespace collision manual', () => {
+  const source = 'type ref = number\nexport const value = ref(1)'
+  const { findings, output } = migrate('src/Collision.ts', source)
+  expect(findings).toMatchObject([{ name: 'ref', fixable: false, reason: 'An existing top-level binding uses this import name.' }])
+  expect(output).toBe(source)
+})
+
+test('does not insert code outside a self-closing script setup tag', () => {
+  const source = '<script setup lang="ts" />\n<template><ElButton v-loading />{{ ref(1) }}</template>'
+  const { findings, output } = migrate('src/SelfClosing.vue', source)
+  expect(findings.map(({ name, fixable, reason }) => [name, fixable, reason])).toEqual(
+    ['ElButton', 'loading', 'ref'].map(name => [name, false, 'Expand the self-closing <script setup /> before adding imports.']),
+  )
+  expect(output).toBe(source)
+})
