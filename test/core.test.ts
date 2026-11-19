@@ -439,6 +439,15 @@ describe('module resolution during migration', () => {
     expect(project.sameFile(resolve(root, 'src/utils/index'), resolve(root, 'src/utils/index.ts'))).toBe(true)
   })
 
+  test.each(['Foo.ts', 'Foo/index.ts'])('shortens %s when Foo.vue shares its basename', script => {
+    const root = temporaryProject({
+      ['src/' + script]: 'export const foo = 1',
+      'src/Foo.vue': '<template><div /></template>',
+    })
+    const project = new Project({ root, alias: { '@': 'src' } })
+    expect(project.aliasFor(resolve(root, 'src', script), false)).toBe('@/Foo')
+  })
+
   test('keeps explicit extensions when multiple runtime modules share the stem', () => {
     const root = temporaryProject({
       '.unimport-items.json': '[{"from":"./src/utils.ts","name":"util"},{"from":"./src/utils/index.ts","name":"nested"}]',

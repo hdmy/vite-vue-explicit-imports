@@ -7,7 +7,7 @@ import type { ExplicitImportsOptions } from './types'
 
 export const SOURCE_EXTENSIONS = /\.(?:[cm]?[jt]s|[jt]sx|vue)$/
 const SCRIPT_EXTENSION = /\.(?:[cm]?[jt]s|[jt]sx)$/
-const MODULE_EXTENSIONS = ['.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.cjs', '.cts', '.json', '.vue']
+const MODULE_EXTENSIONS = ['.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.cjs', '.cts', '.json']
 const TS_REPLACEMENTS: Record<string, string[]> = {
   '.js': ['.ts', '.tsx'], '.jsx': ['.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'],
 }

@@ -192,7 +192,13 @@ function scriptMetadata(descriptor: SFCDescriptor, project: Project, normal?: Pa
             dependencies.add(file)
             return readFileSync(file, 'utf8')
           },
-          realpath: realpathSync,
+          realpath(file) {
+            try {
+              return realpathSync(file)
+            } catch {
+              return file
+            }
+          },
         },
       })
       metadata = compiled.bindings ?? {}
