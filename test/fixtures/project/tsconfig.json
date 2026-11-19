@@ -1,0 +1,4 @@
+{
+  // Solution config
+  "references": [{ "path": "./tsconfig.web.json" },],
+}

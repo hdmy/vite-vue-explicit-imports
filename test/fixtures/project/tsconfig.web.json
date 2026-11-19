@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"], /* most source files */
+      "@ui/*": ["./src/components/*"],
+      "exact": ["./src/utils/message.ts"],
+      "https://example.com/path,}": ["./unused.ts"],
+    },
+  },
+}
