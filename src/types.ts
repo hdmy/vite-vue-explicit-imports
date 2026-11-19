@@ -37,5 +37,6 @@ export interface ExplicitImportsOptions {
   ignoreImports?: string[]
   ignoreComponents?: string[]
   ignoreDirectives?: string[]
+  externalStyles?: string[]
   report?: boolean | string
 }

@@ -18,6 +18,7 @@ interface Flags {
   ignoreImports?: string | string[]
   ignoreComponents?: string | string[]
   ignoreDirectives?: string | string[]
+  externalStyles?: string | string[]
   exclude?: string | string[]
   report?: boolean | string
   json?: boolean
@@ -39,6 +40,7 @@ cli.option('--root <dir>', 'Project root')
   .option('--ignore-imports <list>', 'Comma-separated global import names')
   .option('--ignore-components <list>', 'Comma-separated component names')
   .option('--ignore-directives <list>', 'Comma-separated directive names')
+  .option('--external-styles <list>', 'UI packages with styles provided separately in every entry point')
   .option('--exclude <list>', 'Comma-separated glob exclusions')
   .option('--report <path>', 'Write the check report to this path')
   .option('--no-report', 'Disable the check report', { default: '' })
@@ -57,7 +59,8 @@ function sessionOptions(paths: string[], flags: Flags): SessionOptions {
     root: flags.root, config: flags.config, mode, paths,
     importsDts: flags.importsDts, componentsDts: flags.componentsDts, unimportItems: flags.unimportItems,
     ignoreImports: split(flags.ignoreImports), ignoreComponents: split(flags.ignoreComponents),
-    ignoreDirectives: split(flags.ignoreDirectives), exclude: split(flags.exclude), report: flags.report === '' ? undefined : flags.report,
+    ignoreDirectives: split(flags.ignoreDirectives), externalStyles: split(flags.externalStyles),
+    exclude: split(flags.exclude), report: flags.report === '' ? undefined : flags.report,
   }
 }
 

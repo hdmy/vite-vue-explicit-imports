@@ -22,6 +22,8 @@ npx skills add hdmy/vite-vue-explicit-imports
 
 Keep the legacy plugins and registry files while migrating. The CLI discovers `.unimport-items.json` or `auto-imports.d.ts`, and `components.d.ts`. It also looks for these declarations and prefixed variants such as `src/web.components.d.ts` under `src/`.
 
+On CI and clean checkouts, generate or commit the registries before running `check`, `migrate` or a `strict` build. A missing registry for an enabled category fails the scan. Use `--category imports` for projects that only use auto-imports, or set `mode: { imports: 'strict', components: 'off', directives: 'off' }` in Vite. Pass `--config vite.web.config.mts` when the project uses a non-default Vite config.
+
 ```sh
 pnpm exec vite-vue-explicit-imports check
 pnpm exec vite-vue-explicit-imports check --no-report --json
@@ -32,7 +34,7 @@ pnpm exec vite-vue-explicit-imports check src/pages
 
 Both commands accept file, directory and quoted glob filters relative to the root. `check` prints findings and counts per category and directory. Its exit code is 1 when findings remain and 0 when clean. CLI errors use exit code 2. `migrate` lists changes and manual findings. A successful invocation exits 0.
 
-Shared flags include `--root <dir>`, `--config <file>`, `--category <list>`, `--imports-dts <file>`, `--components-dts <file>`, `--unimport-items <file>`, `--ignore-imports <list>`, `--ignore-components <list>`, `--ignore-directives <list>`, `--exclude <list>` and `--json`. Lists are comma-separated. Configure brace-expansion globs through the JavaScript `exclude` option.
+Shared flags include `--root <dir>`, `--config <file>`, `--category <list>`, `--imports-dts <file>`, `--components-dts <file>`, `--unimport-items <file>`, `--ignore-imports <list>`, `--ignore-components <list>`, `--ignore-directives <list>`, `--external-styles <list>`, `--exclude <list>` and `--json`. List flags accept comma-separated or repeated values. Configure brace-expansion globs through the JavaScript `exclude` option.
 
 `check` writes `.explicit-imports-report.json` at the project root. Override it with `--report <path>` or disable it with `--no-report`. `migrate --dry-run` writes no source changes or report. Config loading is best effort. If it fails, CLI alias resolution uses project tsconfigs and explicit options.
 
@@ -67,9 +69,16 @@ The plugin reads sources from disk, so earlier transforms cannot hide implicit i
 | `unimportItems`, `importsDts`, `componentsDts` | Registry paths relative to the root. A discovered or explicit unimport dump takes priority over the imports declaration. |
 | `packageSpecifiers` | Package specifier overrides. Defaults include `element-plus/es` → `element-plus` and `ant-design-vue/es` → `ant-design-vue`. |
 | `ignoreImports`, `ignoreComponents`, `ignoreDirectives` | Intentional globals to exclude from migration. |
+| `externalStyles` | UI packages whose styles are already supplied in every entry point. Runtime findings for Element Plus and Ant Design Vue require this confirmation before auto-migration. |
 | `report` | Boolean or report path relative to the root. |
 
+## Keep resolver styles
+
+Element Plus and Ant Design Vue resolvers can inject CSS alongside runtime imports. Explicit imports bypass that injection. These findings count in checks and `strict` builds and require manual handling by default. Verify that every entry point, including secondary or offline builds, loads the global theme CSS or uses a style plugin such as `unplugin-element-plus`. Then opt in with `--external-styles element-plus` on the CLI or `externalStyles: ['element-plus']` in the API. Add `ant-design-vue` separately when its styles are covered. Type-only imports and local overrides remain eligible for automatic migration.
+
 ## Before and after
+
+This example assumes Element Plus styles are supplied separately and `element-plus` was opted in.
 
 ```diff
  <script setup lang="ts">
@@ -93,6 +102,6 @@ If Element Plus `v-loading` is intentionally global, register it once with `impo
 
 ## Remove the legacy plugins
 
-Use the initial `check` counts as a baseline. Migrate and verify one directory at a time, then promote each clean category to `strict`. After a full clean scan, remove the auto-import plugin calls from Vite, Vitest and ESLint configuration where applicable. Uninstall `unplugin-auto-import` and `unplugin-vue-components`. Delete generated `*.auto-imports.d.ts`, `*.components.d.ts`, `.eslintrc-auto-import.json` and `.unimport-items.json` and remove their configuration references. Run your typecheck, tests and build after teardown.
+Use the initial `check` counts as a baseline. Migrate and verify one directory at a time, then promote each clean category to `strict`. After a full clean scan, remove the auto-import plugin calls from Vite, Vitest and ESLint configuration where applicable. Uninstall `unplugin-auto-import` and `unplugin-vue-components`. Remove the migration guard or disable its categories before deleting the registries. Delete generated `*.auto-imports.d.ts`, `*.components.d.ts`, `.eslintrc-auto-import.json` and `.unimport-items.json` and remove their configuration references. Run your typecheck, tests and build after teardown.
 
 [MIT](LICENSE)

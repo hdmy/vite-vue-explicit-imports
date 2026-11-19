@@ -1,7 +1,7 @@
 export * from './types'
 export { resolveModes } from './options'
 export { Project } from './project'
-export { loadRegistry } from './registry'
+export { assertRegistryReady, loadRegistry } from './registry'
 export type { Registry, ImportEntry, ComponentEntry, DirectiveEntry } from './registry'
 export { analyzeFile } from './analyze'
 export type { Analysis } from './analyze'

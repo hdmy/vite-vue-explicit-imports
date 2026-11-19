@@ -3,9 +3,9 @@ import { isAbsolute, resolve } from 'pathe'
 import type { Plugin, ResolvedConfig } from 'vite'
 import { analyzeFile } from './analyze'
 import { Project } from './project'
-import { loadRegistry } from './registry'
+import { assertRegistryReady, isRegistryFile, loadRegistry } from './registry'
 import type { Registry } from './registry'
-import { countFindings, formatFileLine, mergeReport, reportPath, writeReport } from './report'
+import { countFindings, formatFileLine, reportPath, writeReport } from './report'
 import { normalizeViteAliases } from './run'
 import { CATEGORIES } from './types'
 import type { ExplicitImportsOptions, Finding, Report } from './types'
@@ -27,27 +27,30 @@ function existingFindings(file: string): Finding[] {
 
 export function explicitImports(options: ExplicitImportsOptions = {}): Plugin {
   let project: Project
-  let registry: Registry
+  let registry: Registry | undefined
   let log: ResolvedConfig['logger']
-  let report: Report
+  let report: Omit<Report, 'findings'>
   let output: string | undefined
-  let dirty = false
   let summarized = false
   let timer: ReturnType<typeof setTimeout> | undefined
+  const pendingUpdates = new Map<string, Finding[]>()
   const warned = new Map<string, Set<string>>()
   const buildWarnings = new Map<string, Finding[]>()
 
   function flush(): void {
     clearTimeout(timer)
     timer = undefined
-    if (output && dirty) writeReport(output, report)
-    dirty = false
+    if (!output || !pendingUpdates.size) return
+    const kept = existingFindings(output).filter(finding => !pendingUpdates.has(finding.file))
+    writeReport(output, {
+      ...report, generatedAt: new Date().toISOString(), findings: [...kept, ...[...pendingUpdates.values()].flat()],
+    })
+    pendingUpdates.clear()
   }
 
   function update(file: string, findings: Finding[]): void {
     if (!output) return
-    report = mergeReport(report, file, findings)
-    dirty = true
+    pendingUpdates.set(file, findings)
     clearTimeout(timer)
     timer = setTimeout(() => {
       try { flush() } catch (error) { log.error(`[explicit-imports] ${String(error)}`) }
@@ -58,7 +61,15 @@ export function explicitImports(options: ExplicitImportsOptions = {}): Plugin {
   function forget(file: string): void {
     warned.delete(file)
     buildWarnings.delete(file)
-    if (output && report.findings.some(finding => finding.file === file)) update(file, [])
+    if (output && (pendingUpdates.has(file) || existingFindings(output).some(finding => finding.file === file))) update(file, [])
+  }
+
+  function ensureRegistry(): Registry {
+    if (registry) return registry
+    const loaded = loadRegistry(project)
+    assertRegistryReady(project, loaded)
+    registry = loaded
+    return loaded
   }
 
   function finish(): void {
@@ -77,26 +88,40 @@ export function explicitImports(options: ExplicitImportsOptions = {}): Plugin {
     configResolved(config) {
       const root = resolve(config.root, options.root ?? '.')
       project = new Project({ ...options, root, alias: { ...normalizeViteAliases(config.resolve.alias, config.root), ...options.alias } })
-      registry = loadRegistry(project)
+      registry = undefined
       log = config.logger
       output = options.report === false ? undefined : reportPath(root, typeof options.report === 'string' ? options.report : undefined)
       report = {
         version: 1, generatedAt: new Date().toISOString(), source: config.command === 'build' ? 'build' : 'dev',
-        modes: project.modes, findings: output ? existingFindings(output) : [],
+        modes: project.modes,
       }
-      dirty = false
+      pendingUpdates.clear()
       summarized = false
       warned.clear()
       buildWarnings.clear()
     },
     configureServer(server) {
-      server.watcher.on('unlink', path => forget(resolve(path)))
+      for (const path of [options.unimportItems, options.importsDts, options.componentsDts]) {
+        if (path !== undefined) server.watcher.add(resolve(project.root, path))
+      }
+      const invalidate = (path: string) => {
+        if (!isRegistryFile(project, resolve(path))) return
+        registry = undefined
+        server.moduleGraph.invalidateAll()
+      }
+      server.watcher.on('add', invalidate).on('change', invalidate).on('unlink', path => {
+        invalidate(path)
+        forget(resolve(path))
+      })
       server.httpServer?.once('close', flush)
     },
     watchChange(id, { event }) {
-      if (event === 'delete') forget(resolve(id))
+      const file = resolve(id)
+      if (isRegistryFile(project, file)) registry = undefined
+      if (event === 'delete') forget(file)
     },
     buildStart() {
+      registry = undefined
       summarized = false
     },
     transform(_code, id) {
@@ -111,7 +136,16 @@ export function explicitImports(options: ExplicitImportsOptions = {}): Plugin {
         forget(file)
         return
       }
-      const { findings } = analyzeFile(file, source, project, registry)
+      let loaded: Registry
+      try {
+        loaded = ensureRegistry()
+      } catch (error) {
+        this.error(error instanceof Error ? error : String(error))
+      }
+      if (report.source === 'build') {
+        for (const path of Object.values(loaded.sources)) this.addWatchFile(path)
+      }
+      const { findings } = analyzeFile(file, source, project, loaded)
       update(file, findings)
       const warnings = findings.filter(finding => project.modes[finding.category] === 'warn')
       if (report.source === 'build') buildWarnings.set(file, warnings)

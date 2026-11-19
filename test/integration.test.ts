@@ -38,6 +38,15 @@ function readReport(root: string, path = '.explicit-imports-report.json'): Repor
   return JSON.parse(readFileSync(resolve(root, path), 'utf8'))
 }
 
+function withoutRegistries(): string {
+  const root = createProject()
+  rmSync(resolve(root, 'src/auto-imports.d.ts'))
+  rmSync(resolve(root, 'components.d.ts'))
+  return root
+}
+
+const importsOnly = { imports: 'strict', components: 'off', directives: 'off' } as const
+
 afterEach(() => {
   for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
@@ -79,6 +88,35 @@ describe('runner and reports', () => {
     const fallback = await openSession({ root, config: 'broken.config.ts', paths: [screen], alias: { '@fallback': 'src' } })
     expect(fallback.configError).toContain('config failed')
     expect(check(fallback, { report: false }).report.findings[0].suggestion).toBe("import { local } from '@fallback/local'")
+  })
+
+  test('bundles the intended index module after migrating a project with a sibling file', async () => {
+    const root = createProject({
+      '.unimport-items.json': '[{"from":"./src/utils/index.ts","name":"utility"}]',
+      'src/entry.ts': 'export const result = utility()',
+      'src/utils.ts': 'export const utility = () => "sibling-file"',
+      'src/utils/index.ts': 'export const utility = () => "index-module"',
+    })
+    const session = await openSession({ root, paths: ['src/entry.ts'], alias: { '@': 'src' } })
+    expect(migrate(session).changed).toEqual([resolve(root, 'src/entry.ts')])
+    expect(readFileSync(resolve(root, 'src/entry.ts'), 'utf8')).toContain("from '@/utils/index'")
+    const bundle = await build({
+      root, configFile: false, logLevel: 'silent', resolve: { alias: { '@': resolve(root, 'src') } },
+      build: { write: false, lib: { entry: resolve(root, 'src/entry.ts'), formats: ['es'] } },
+    })
+    const chunks = [bundle].flat().flatMap(result => 'output' in result ? result.output : [])
+      .flatMap(output => output.type === 'chunk' ? [output.code] : [])
+    expect(chunks.join('')).toContain('index-module')
+    expect(chunks.join('')).not.toContain('sibling-file')
+  })
+
+  test('ignores an unused components registry when only imports are enabled', async () => {
+    const root = withoutRegistries()
+    writeFileSync(resolve(root, '.unimport-items.json'), '[{"from":"vue","name":"ref"}]')
+    writeFileSync(resolve(root, 'components.d.ts'), 'breaking TS syntax {{{')
+    const session = await openSession({ root, mode: importsOnly, componentsDts: 'components.d.ts' })
+    expect(session.registry.sources).toEqual({ imports: resolve(root, '.unimport-items.json') })
+    expect(check(session, { report: false }).report.findings).toMatchObject([{ name: 'ref' }])
   })
 
   test('distinguishes dry-run, written edits, and manual findings', async () => {
@@ -148,6 +186,55 @@ describe('Vite plugin', () => {
     }
   })
 
+  test('merges a CLI report written while dev is running and clears its deleted entries', async () => {
+    const root = createProject({
+      'src/a.js': 'export const a = 1',
+      'src/b.js': 'export const b = ref(1)',
+    })
+    const server = await createServer({
+      root, configFile: false, logLevel: 'silent', server: { middlewareMode: true, ws: false },
+      plugins: [explicitImports()],
+    })
+    try {
+      const { report } = check(await openSession({ root, paths: ['src/b.js'] }))
+      expect(report.findings).toHaveLength(1)
+      await server.transformRequest('/src/a.js')
+      await vi.waitFor(() => expect(readReport(root)).toMatchObject({ source: 'dev', findings: report.findings }))
+
+      // A second CLI report includes a file the dev server has never transformed.
+      const fromCli = check(await openSession({ root, paths: ['src/b.js', screen] })).report
+      expect(fromCli.findings).toHaveLength(2)
+      const deleted = resolve(root, 'src/b.js')
+      rmSync(deleted)
+      server.watcher.emit('unlink', deleted)
+      await vi.waitFor(() => expect(readReport(root)).toMatchObject({
+        source: 'dev', findings: fromCli.findings.filter(finding => finding.file !== deleted),
+      }))
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('reloads the dev registry after a registry file changes', async () => {
+    const root = createProject({ 'src/entry.js': 'export const value = ref(1)' })
+    const dump = resolve(root, '.unimport-items.json')
+    writeFileSync(dump, '[]')
+    const server = await createServer({
+      root, configFile: false, logLevel: 'silent', server: { middlewareMode: true, ws: false },
+      plugins: [explicitImports()],
+    })
+    try {
+      await server.transformRequest('/src/entry.js')
+      await vi.waitFor(() => expect(readReport(root).findings).toEqual([]))
+      writeFileSync(dump, '[{"from":"vue","name":"ref"}]')
+      server.watcher.emit('change', dump)
+      await server.transformRequest('/src/entry.js')
+      await vi.waitFor(() => expect(readReport(root).findings).toMatchObject([{ name: 'ref' }]))
+    } finally {
+      await server.close()
+    }
+  })
+
   test('leaves the existing report byte-for-byte when closing without a transform', async () => {
     const root = createProject()
     const { reportFile } = check(await openSession({ root }))
@@ -204,6 +291,38 @@ describe('Vite plugin', () => {
       '[explicit-imports] 1 finding(s) (1 imports, 0 components, 0 directives).',
     ])
     expect(readReport(root).findings.map(finding => finding.file)).toEqual([resolve(root, 'src/entry.js')])
+  })
+
+  test.each([false, true])('the first strict build uses the dump generated in buildStart (explicit: %s)', async explicit => {
+    const root = withoutRegistries()
+    await expect(build({
+      root, configFile: false, logLevel: 'silent',
+      plugins: [
+        explicitImports({ mode: importsOnly, unimportItems: explicit ? '.unimport-items.json' : undefined, report: false }),
+        {
+          name: 'generate-auto-imports',
+          async buildStart() {
+            await Promise.resolve()
+            writeFileSync(resolve(root, '.unimport-items.json'), '[{"from":"vue","name":"ref"}]')
+          },
+        },
+      ],
+      build: { write: false, rollupOptions: { input: resolve(root, screen) } },
+    })).rejects.toThrow(/src\/pages\/index\.ts:1:24[\s\S]*import \{ ref \} from 'vue'/)
+  })
+
+  test('fails a strict build when an enabled registry is missing', async () => {
+    const root = withoutRegistries()
+    const options = {
+      root, configFile: false as const, logLevel: 'silent' as const,
+      build: { write: false, rollupOptions: { input: resolve(root, screen) } },
+    }
+    await expect(build({ ...options, plugins: [explicitImports({ mode: 'strict' })] }))
+      .rejects.toThrow(/Missing imports registry.*--unimport-items/)
+    writeFileSync(resolve(root, '.unimport-items.json'), '[]')
+    await expect(build({ ...options, plugins: [explicitImports({ mode: 'strict' })] }))
+      .rejects.toThrow(/Missing components registry.*--components-dts/)
+    await expect(build({ ...options, plugins: [explicitImports({ mode: importsOnly })] })).resolves.toBeDefined()
   })
 
   test('fails a strict build with a file location, suggestion and migration hint', async () => {
@@ -264,6 +383,36 @@ describe('built CLI', () => {
     const invalid = invoke(root, 'check', '--category', 'wrong')
     expect(invalid.status).toBe(2)
     expect(invalid.stderr).toContain('Invalid category')
+  })
+
+  test('fails CLI check and migrate with exit 2 if an enabled registry is missing', () => {
+    const root = withoutRegistries()
+    for (const command of ['check', 'migrate']) {
+      const result = invoke(root, command, '--no-report')
+      expect(result.status).toBe(2)
+      expect(result.stderr).toMatch(/Missing imports registry.*--unimport-items/)
+    }
+    writeFileSync(resolve(root, '.unimport-items.json'), '[{"from":"vue","name":"ref"}]')
+    expect(invoke(root, 'check', '--no-report').stderr).toMatch(/Missing components registry.*--components-dts/)
+    const detected = invoke(root, 'check', '--category', 'imports', '--no-report', '--json')
+    expect(detected.status).toBe(1)
+    expect(JSON.parse(detected.stdout).findings).toMatchObject([{ name: 'ref' }])
+    writeFileSync(resolve(root, screen), 'export const counter = 0')
+    expect(invoke(root, 'check', '--category', 'imports', '--no-report').status).toBe(0)
+  })
+
+  test('only migrates resolver-styled components when their packages are confirmed', () => {
+    const root = createProject()
+    const blocked = invoke(root, 'migrate', '--json', views)
+    expect(blocked.status).toBe(0)
+    expect(JSON.parse(blocked.stdout)).toMatchObject({
+      changed: [], manual: [{ name: 'ElButton', reason: expect.stringContaining('--external-styles element-plus') }],
+    })
+    expect(readFileSync(resolve(root, views), 'utf8')).toBe('<template><ElButton /></template>')
+    const allowed = invoke(root, 'migrate', '--json', '--external-styles', 'ant-design-vue', '--external-styles', 'element-plus', views)
+    expect(allowed.status).toBe(0)
+    expect(JSON.parse(allowed.stdout)).toMatchObject({ changed: [resolve(root, views)], manual: [] })
+    expect(readFileSync(resolve(root, views), 'utf8')).toContain("import { ElButton } from 'element-plus'")
   })
 
   test('accepts repeated list flags alongside comma-separated values', () => {

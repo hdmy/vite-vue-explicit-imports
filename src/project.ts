@@ -7,6 +7,40 @@ import type { ExplicitImportsOptions } from './types'
 
 export const SOURCE_EXTENSIONS = /\.(?:[cm]?[jt]s|[jt]sx|vue)$/
 const SCRIPT_EXTENSION = /\.(?:[cm]?[jt]s|[jt]sx)$/
+const MODULE_EXTENSIONS = ['.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.cjs', '.cts', '.json', '.vue']
+const TS_REPLACEMENTS: Record<string, string[]> = {
+  '.js': ['.ts', '.tsx'], '.jsx': ['.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'],
+}
+
+export function isFile(file: string): boolean {
+  return statSync(file, { throwIfNoEntry: false })?.isFile() ?? false
+}
+
+function moduleFiles(stem: string): string[] {
+  return [stem, ...MODULE_EXTENSIONS.map(extension => stem + extension)].filter(isFile)
+}
+
+function concreteFiles(path: string): string[] {
+  if (isFile(path)) return [path]
+  const extension = SCRIPT_EXTENSION.exec(path)?.[0]
+  if (extension) return (TS_REPLACEMENTS[extension] ?? []).map(ext => path.slice(0, -extension.length) + ext).filter(isFile)
+  if (path.endsWith('.vue') || path.endsWith('.json')) return []
+  const files = moduleFiles(path)
+  if (files.length || isFile(join(path, 'package.json'))) return files
+  return moduleFiles(join(path, 'index'))
+}
+
+function shortenModule(file: string): string {
+  const stem = file.replace(SCRIPT_EXTENSION, '')
+  const concrete = concreteFiles(file)
+  if (stem !== file && moduleFiles(stem).some(candidate => !concrete.includes(candidate))) return file
+  if (!stem.endsWith('/index') || concrete.length > 1) return stem
+  const directory = dirname(stem)
+  if (moduleFiles(directory).length || isFile(join(directory, 'package.json'))) return stem
+  const indexes = moduleFiles(stem)
+  return indexes.some(candidate => !concrete.includes(candidate)) ? stem : directory
+}
+
 const DEFAULT_EXCLUDE = [
   '**/node_modules/**', '**/dist/**', '**/.git/**', '**/*.d.{ts,mts,cts}',
   '**/*.config.*', '**/*.{test,spec}.*', '**/{test,tests,__tests__,e2e}/**',
@@ -111,16 +145,18 @@ export class Project {
 
   aliasFor(absPath: string, keepExtension: boolean, importingFile?: string): string | undefined {
     const file = resolve(absPath)
-    const clean = (specifier: string) => keepExtension
-      ? specifier
-      : specifier.replace(SCRIPT_EXTENSION, '').replace(/\/index$/, '')
+    const target = keepExtension ? file : shortenModule(file)
     for (const [alias, entry] of [...this.aliases].reverse().sort(([, a], [, b]) => b.path.length - a.path.length)) {
       if (file === entry.path || (!entry.wildcard && this.sameFile(file, entry.path))) return alias
       const suffix = relative(entry.path, file)
-      if (entry.wildcard && inside(suffix)) return clean(`${alias}/${suffix}`)
+      if (entry.wildcard && inside(suffix)) {
+        const shortened = relative(entry.path, target)
+        const path = inside(shortened) ? shortened : suffix
+        return path ? `${alias}/${path}` : alias
+      }
     }
     if (importingFile) {
-      const path = clean(relative(dirname(importingFile), file))
+      const path = relative(dirname(importingFile), target)
       return path === '..' || path.startsWith('../') ? path : path ? `./${path}` : './'
     }
   }
@@ -130,8 +166,12 @@ export class Project {
     const first = resolve(a)
     const second = resolve(b)
     if (first === second) return true
-    // Two concrete files can be different even when their extensionless paths match.
-    if ([first, second].every(file => existsSync(file) && statSync(file).isFile())) return false
+    const firstFiles = concreteFiles(first)
+    const secondFiles = concreteFiles(second)
+    if (firstFiles.length || secondFiles.length) {
+      return firstFiles.length === 1 && secondFiles.length === 1 && firstFiles[0] === secondFiles[0]
+    }
+    if ([first, second].some(file => isFile(join(file, 'package.json')))) return false
     const normalize = (file: string) => file.replace(SCRIPT_EXTENSION, '').replace(/\/index$/, '')
     return normalize(first) === normalize(second)
   }

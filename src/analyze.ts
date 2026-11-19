@@ -1,14 +1,17 @@
-import { compileScript, compileTemplate, parse } from '@vue/compiler-sfc'
+import { readFileSync, realpathSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { compileScript, compileTemplate, invalidateTypeCache, parse, registerTS } from '@vue/compiler-sfc'
 import type { SFCDescriptor } from '@vue/compiler-sfc'
 import { parseSync } from 'oxc-parser'
 import type { Node, ObjectExpression, Program } from 'oxc-parser'
 import { isReferenceIdentifier, parseAndWalk, ScopeTracker, ScopeTrackerImport, walk } from 'oxc-walker'
-import { resolve } from 'pathe'
-import { Project, SOURCE_EXTENSIONS } from './project'
-import { kebabCase, pascalCase, staticName } from './registry'
+import { join, resolve } from 'pathe'
+import { isFile, Project, SOURCE_EXTENSIONS } from './project'
+import { kebabCase, pascalCase, resolverStylePackage, staticName } from './registry'
 import type { ImportEntry, Registry } from './registry'
 import type { Category, Finding } from './types'
 
+const UNRESOLVED_METADATA = 'Vue script metadata or externally imported prop types could not be resolved. Verify this template usage manually.'
 const MACROS = new Set([
   'defineProps', 'defineEmits', 'defineExpose', 'defineOptions', 'defineSlots', 'defineModel', 'withDefaults',
 ])
@@ -84,7 +87,9 @@ function optionRegistry(options: ObjectExpression | undefined, name: string) {
   }))
   return { object, names, writable: !!options
     && options.properties.every(prop => prop.type === 'Property' && (!prop.computed || prop.key.type === 'Literal'))
-    && (!property || !!object) }
+    && (!property || !!object)
+    && (object?.properties.every(prop =>
+      prop.type === 'Property' && prop.kind === 'init' && (!prop.computed || prop.key.type === 'Literal')) ?? true) }
 }
 
 function setupProps(program: Program): Set<string> {
@@ -145,8 +150,28 @@ function setupProps(program: Program): Set<string> {
   return names
 }
 
-function scriptMetadata(descriptor: SFCDescriptor, normal?: ParsedScript, setup?: ParsedScript) {
+let registeredTypeScript = false
+const attemptedTypeScript = new WeakSet<Project>()
+
+function registerProjectTypeScript(project: Project): void {
+  if (registeredTypeScript || attemptedTypeScript.has(project)) return
+  attemptedTypeScript.add(project)
+  for (const from of [join(project.root, 'package.json'), import.meta.url]) {
+    try {
+      const compiler = createRequire(from)('typescript')
+      registerTS(() => compiler)
+      registeredTypeScript = true
+      return
+    } catch {
+      // Relative type imports still work through the filesystem adapter.
+    }
+  }
+}
+
+function scriptMetadata(descriptor: SFCDescriptor, project: Project, normal?: ParsedScript, setup?: ParsedScript) {
   let metadata: NonNullable<NonNullable<Parameters<typeof compileTemplate>[0]['compilerOptions']>['bindingMetadata']> = {}
+  let unresolvedMetadata = false
+  const dependencies = new Set<string>()
   try {
     const declaration = normal?.target.program.body.find(node => node.type === 'ExportDefaultDeclaration')?.declaration
     const object = !setup && normal && optionsObject(normal.target.program)
@@ -156,9 +181,29 @@ function scriptMetadata(descriptor: SFCDescriptor, normal?: ParsedScript, setup?
         descriptor.script.content.slice(0, declaration.start) + descriptor.script.content.slice(object.start, object.end)
         + descriptor.script.content.slice(declaration.end) } }
       : descriptor
-    if (input.script || input.scriptSetup) metadata = compileScript(input, { id: 'explicit-imports' }).bindings ?? {}
+    if (input.script || input.scriptSetup) {
+      if (input.scriptSetup) registerProjectTypeScript(project)
+      const compiled = compileScript(input, {
+        id: 'explicit-imports',
+        fs: {
+          fileExists: isFile,
+          readFile(file) {
+            if (!isFile(file)) return
+            dependencies.add(file)
+            return readFileSync(file, 'utf8')
+          },
+          realpath: realpathSync,
+        },
+      })
+      metadata = compiled.bindings ?? {}
+      for (const file of compiled.deps ?? []) dependencies.add(file)
+    }
   } catch {
+    unresolvedMetadata = true
     if (setup) for (const name of setupProps(setup.target.program)) metadata[name] = 'props' as typeof metadata[string]
+  } finally {
+    // The compiler caches imported scopes and tsconfigs across analyses, including dev transforms.
+    for (const file of dependencies) invalidateTypeCache(file)
   }
   if (setup) {
     for (const script of [normal, setup]) {
@@ -167,7 +212,7 @@ function scriptMetadata(descriptor: SFCDescriptor, normal?: ParsedScript, setup?
       }
     }
   }
-  return metadata
+  return { metadata, unresolvedMetadata }
 }
 
 export function formatImport(request: ImportRequest, quote = "'"): string {
@@ -213,7 +258,12 @@ export function analyzeFile(file: string, source: string, project: Project, regi
     target?: ScriptTarget, reason?: string, register?: string, reuse?: boolean,
   ) => {
     if (project.modes[category] === 'off' || project.sameFile(entry.filePath, file)) return
-    const key = JSON.stringify([category, entry.local, category === 'components' && !!reason && !register])
+    const unverified = reason === UNRESOLVED_METADATA
+    const pkg = !type && resolverStylePackage(entry)
+    if (!reason && pkg && !project.options.externalStyles?.includes(pkg)) {
+      reason = `Explicit imports from '${pkg}' bypass resolver-injected styles. Confirm global theme CSS or a style plugin in every entry point, then pass --external-styles ${pkg} (or externalStyles: ['${pkg}']).`
+    }
+    const key = JSON.stringify([category, entry.local, unverified, category === 'components' && !!reason && !register])
     const current = pending.get(key)
     if (!current || (current.type && !type)) {
       pending.set(key, {
@@ -272,7 +322,7 @@ export function analyzeFile(file: string, source: string, project: Project, regi
 
   const template = descriptor?.template
   if (descriptor && template && !template.src && (!template.lang || template.lang === 'html')) {
-    const metadata = scriptMetadata(descriptor, normal, setup)
+    const { metadata, unresolvedMetadata } = scriptMetadata(descriptor, project, normal, setup)
     const compiled = compileTemplate({
       filename: file, id: 'explicit-imports', source: template.content,
       compilerOptions: { prefixIdentifiers: true, bindingMetadata: metadata },
@@ -286,8 +336,11 @@ export function analyzeFile(file: string, source: string, project: Project, regi
       const registeredComponents = optionRegistry(options, 'components')
       const registeredDirectives = optionRegistry(options, 'directives')
       const unavailable = selfClosingSetup ? 'Expand the self-closing <script setup /> before adding imports.'
+        : unresolvedMetadata ? UNRESOLVED_METADATA
         : hasScript && !setup ? 'This template requires a manual Options API binding.' : undefined
-      const unavailableComponent = selfClosingSetup ? unavailable : 'Could not safely edit the Options API components registry.'
+      const unavailableComponent = selfClosingSetup ? unavailable
+        : unresolvedMetadata ? UNRESOLVED_METADATA
+        : 'Could not safely edit the Options API components registry.'
       const templateOffset = template.loc.start.offset
       const visit = (value: unknown): void => {
         if (Array.isArray(value)) {
@@ -326,7 +379,7 @@ export function analyzeFile(file: string, source: string, project: Project, regi
               normal.target.registration ??= { options, components: registeredComponents.object, names: [] }
             }
             add(entry, 'components', offset + 1, false, setup?.target ?? (canRegister ? normal.target : undefined),
-              hasScript && !setup && !canRegister ? unavailableComponent : undefined,
+              unresolvedMetadata || (hasScript && !setup && !canRegister) ? unavailableComponent : undefined,
               canRegister ? entry.local : undefined, reuse)
           }
         }

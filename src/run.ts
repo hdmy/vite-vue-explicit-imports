@@ -7,7 +7,7 @@ import type { ResolvedConfig } from 'vite'
 import { analyzeFile } from './analyze'
 import { applyFixes } from './fix'
 import { Project } from './project'
-import { loadRegistry } from './registry'
+import { assertRegistryReady, loadRegistry } from './registry'
 import type { Registry } from './registry'
 import { countFindings, reportPath, sortFindings, summarizeByDirectory, writeReport } from './report'
 import type { ExplicitImportsOptions, Finding, Report } from './types'
@@ -60,6 +60,8 @@ export async function openSession(options: SessionOptions = {}): Promise<Session
     }
   }
   const project = new Project({ ...options, root, alias: { ...viteAliases, ...options.alias } })
+  const registry = loadRegistry(project)
+  assertRegistryReady(project, registry)
   const files = project.sourceFiles()
   const filters = options.paths?.map(path => {
     const absolute = resolve(root, path)
@@ -68,7 +70,7 @@ export async function openSession(options: SessionOptions = {}): Promise<Session
       || matches(relative(root, file))
   })
   return {
-    project, registry: loadRegistry(project),
+    project, registry,
     files: filters?.length ? files.filter(file => filters.some(matches => matches(file))) : files,
     configError,
   }

@@ -10,6 +10,7 @@ import type { ExplicitImportsOptions } from '../src/index'
 const fixture = resolve('test/fixtures')
 const root = resolve(fixture, 'project')
 const scratch: string[] = []
+const elementPlusStyles = { externalStyles: ['element-plus'] }
 
 function temporaryProject(files: Record<string, string>): string {
   const directory = mkdtempSync(resolve('test/.tmp-'))
@@ -173,7 +174,7 @@ describe('scripts', () => {
 describe('Vue SFCs', () => {
   test('migrates setup scripts, templates, Vue Router components and directives', () => {
     const source = readFileSync(resolve(fixture, 'Setup.vue'), 'utf8')
-    const { output, findings } = migrate('src/Setup.vue', source)
+    const { output, findings } = migrate('src/Setup.vue', source, elementPlusStyles)
     expect(findings.map(item => item.name)).toEqual([
       'definePage', 'ref', 'ElMessage', 'ElButton', 'loading', 'computed', 'AddUserDialog', 'RouterLink', 'RouterView', 'focus',
     ])
@@ -219,12 +220,12 @@ describe('Vue SFCs', () => {
   })
 
   test('registers components in Options API and reports bindings requiring manual work', () => {
-    const { output, findings } = migrate('src/Options.vue', readFileSync(resolve(fixture, 'Options.vue'), 'utf8'))
+    const { output, findings } = migrate('src/Options.vue', readFileSync(resolve(fixture, 'Options.vue'), 'utf8'), elementPlusStyles)
     expect(output).toContain('import { ElButton } from "element-plus";')
     expect(output).toContain('import { RouterView } from "vue-router";')
     expect(output).toContain('    Other: {},\n    ElButton,\n    RouterView,\n')
     expect(findings.filter(item => !item.fixable).map(item => item.name)).toEqual(['useStore', 'focus'])
-    expect(migrate('src/Options.vue', '<script>export default {}</script>\n<template><ElButton /></template>').output)
+    expect(migrate('src/Options.vue', '<script>export default {}</script>\n<template><ElButton /></template>', elementPlusStyles).output)
       .toContain('export default { components: { ElButton } }')
     expect(migrate('src/Options.vue', '<script>export default { components: external }</script>\n<template><ElButton /></template>').findings)
       .toMatchObject([{ name: 'ElButton', fixable: false }])
@@ -301,7 +302,7 @@ describe('Phase 1 review regressions', () => {
 
   test('registers an imported Options API component without duplicating the import', () => {
     const source = '<script lang="ts">\nimport { ElButton } from "element-plus"\nexport default (defineComponent({}) as object)\n</script>\n<template><ElButton /></template>'
-    const { output, findings } = migrate('src/Existing.vue', source)
+    const { output, findings } = migrate('src/Existing.vue', source, elementPlusStyles)
     expect(output).toContain('defineComponent({ components: { ElButton } })')
     expect(output.match(/import \{ ElButton \}/g)).toHaveLength(1)
     expect(findings).toMatchObject([{ suggestion: 'Register ElButton in components', fixable: true }])
@@ -316,10 +317,11 @@ describe('Phase 1 review regressions', () => {
     const { findings } = migrate('src/Props.vue',
       '<script setup lang="ts">\n' + script + '\n</script>\n<template>{{ formatCount }} {{ ref(1) }}</template>')
     expect(findings.map(item => item.name)).toEqual(['ref'])
+    expect(findings[0].fixable).toBe(!script.includes('from'))
   })
 
   test('imports a dynamic component from a template expression', () => {
-    const { findings, output } = migrate('src/Dynamic.vue', '<template><component :is="ElButton" /></template>')
+    const { findings, output } = migrate('src/Dynamic.vue', '<template><component :is="ElButton" /></template>', elementPlusStyles)
     expect(findings).toMatchObject([{ category: 'components', name: 'ElButton', fixable: true }])
     expect(output).toContain("import { ElButton } from 'element-plus'")
   })
@@ -417,3 +419,149 @@ test('does not insert code outside a self-closing script setup tag', () => {
   )
   expect(output).toBe(source)
 })
+
+describe('module resolution during migration', () => {
+  test.each([
+    ['dump via alias', { '.unimport-items.json': '[{"from":"./src/utils/index.ts","name":"utility"}]' }, { '@': 'src' }, '@/utils/index'],
+    ['dump via relative path', { '.unimport-items.json': '[{"from":"./src/utils/index.ts","name":"utility"}]' }, {}, './utils/index'],
+    ['declaration via alias', { 'src/auto-imports.d.ts': "declare global { const utility: typeof import('./utils/index').utility } export {}" }, { '@': 'src' }, '@/utils/index'],
+    ['declaration via relative path', { 'src/auto-imports.d.ts': "declare global { const utility: typeof import('./utils/index').utility } export {}" }, {}, './utils/index'],
+  ] as const)('keeps the index module with a sibling file for %s', (_, registryFiles, alias, expected) => {
+    const root = temporaryProject({
+      ...registryFiles,
+      'src/utils.ts': 'export const sibling = utility()',
+      'src/utils/index.ts': 'export const utility = () => "index"',
+    })
+    const { output } = migrate('src/utils.ts', 'export const sibling = utility()', { root, alias })
+    expect(output).toContain("import { utility } from '" + expected + "'")
+    const project = new Project({ root, alias })
+    expect(project.sameFile(resolve(root, 'src/utils/index'), resolve(root, 'src/utils.ts'))).toBe(false)
+    expect(project.sameFile(resolve(root, 'src/utils/index'), resolve(root, 'src/utils/index.ts'))).toBe(true)
+  })
+
+  test('keeps explicit extensions when multiple runtime modules share the stem', () => {
+    const root = temporaryProject({
+      '.unimport-items.json': '[{"from":"./src/utils.ts","name":"util"},{"from":"./src/utils/index.ts","name":"nested"}]',
+      'src/utils.ts': 'export const util = () => "ts"',
+      'src/utils.js': 'export const util = () => "js"',
+      'src/utils/index.ts': 'export const nested = () => "ts-index"',
+      'src/utils/index.js': 'export const nested = () => "js-index"',
+    })
+    const { output } = migrate('src/Use.ts', 'util(); nested()', { root, alias: { '@': 'src' } })
+    expect(output).toContain("import { util } from '@/utils.ts'")
+    expect(output).toContain("import { nested } from '@/utils/index.ts'")
+  })
+
+  test('keeps the index when a package manifest or an extensionless file can take precedence', () => {
+    const root = temporaryProject({
+      'src/utils/package.json': '{"main":"./main.js"}',
+      'src/utils/main.js': 'export const util = () => "main"',
+      'src/utils/index.ts': 'export const util = () => "index"',
+      'src/other': 'export const util = () => "file"',
+    })
+    const project = new Project({ root, alias: { '@': 'src' } })
+    expect(project.aliasFor(resolve(root, 'src/utils/index.ts'), false)).toBe('@/utils/index')
+    expect(project.aliasFor(resolve(root, 'src/other/index.ts'), false)).toBe('@/other/index')
+  })
+})
+
+describe('imported SFC props', () => {
+  test.each([
+    ['relative', './types', {}],
+    ['tsconfig alias', '@/types', { 'tsconfig.json': '{"compilerOptions":{"paths":{"@/*":["./src/*"]}},"include":["src/**/*"]}' }],
+    ['referenced tsconfig alias', '@/types', {
+      'tsconfig.json': '{"files":[],"references":[{"path":"./tsconfig.app.json"}]}',
+      'tsconfig.app.json': '{"compilerOptions":{"paths":{"@/*":["./src/*"]}},"include":["src/**/*"]}',
+    }],
+  ] as const)('resolves %s before matching template names to the registry', (_, specifier, config) => {
+    const root = temporaryProject({
+      ...config,
+      '.unimport-items.json': '[{"from":"vue","name":"ref"}]',
+      'src/types.ts': 'export interface Props { ref: string }',
+    })
+    const source = '<script setup lang="ts">\nimport type { Props } from ' + JSON.stringify(specifier)
+      + '\ndefineProps<Props>()\n</script>\n<template>{{ ref }}</template>'
+    expect(migrate('src/Props.vue', source, { root }).findings).toEqual([])
+  })
+
+  test('leaves unresolved template imports, components and directives untouched', () => {
+    const source = '<script setup lang="ts">\nimport type { Props } from "./missing-types"\ndefineProps<Props>()\n</script>'
+      + '\n<template><ElButton v-loading />{{ ref }}</template>'
+    const result = migrate('src/Unresolved.vue', source, elementPlusStyles)
+    expect(result.findings.map(({ category, fixable, reason }) => [category, fixable, reason])).toEqual(
+      ['components', 'directives', 'imports'].map(category => [category, false, expect.stringContaining('externally imported prop types')]),
+    )
+    expect(result.output).toBe(source)
+    const withScriptUsage = source.replace('defineProps<Props>()', 'defineProps<Props>()\nconst total = computed(() => 1)')
+    const mixed = migrate('src/Unresolved.vue', withScriptUsage, elementPlusStyles)
+    expect(mixed.findings.find(item => item.name === 'computed')?.fixable).toBe(true)
+    expect(mixed.output).toContain('import { computed } from "vue"')
+    expect(mixed.output).not.toContain('import { ref }')
+  })
+
+  test('retains a script-confirmed type finding even if the same name is unresolved in the template', () => {
+    const source = '<script setup lang="ts">\nimport type { Props } from "./missing-types"\ndefineProps<Props>()\n'
+      + 'type Factory = typeof ref\n</script>\n<template>{{ ref }}</template>'
+    const { output, findings } = migrate('src/MixedUnresolved.vue', source)
+    expect(findings).toMatchObject([{ name: 'ref', fixable: true }, { name: 'ref', fixable: false }])
+    expect(output).toContain('import type { ref } from "vue"')
+  })
+
+  test('reads the current external type after its props change', () => {
+    const root = temporaryProject({
+      '.unimport-items.json': '[{"from":"vue","name":"ref"}]',
+      'src/types.ts': 'export interface Props { label: string }',
+    })
+    const source = '<script setup lang="ts">\nimport type { Props } from "./types"\ndefineProps<Props>()\n</script>'
+      + '\n<template>{{ ref }}</template>'
+    const project = new Project({ root })
+    const registry = loadRegistry(project)
+    expect(analyzeFile('src/Props.vue', source, project, registry).findings).toHaveLength(1)
+    writeFileSync(resolve(root, 'src/types.ts'), 'export interface Props { ref: string }')
+    expect(analyzeFile('src/Props.vue', source, project, registry).findings).toEqual([])
+  })
+})
+
+describe('resolver styles', () => {
+  test('blocks runtime components and directives until their styles are confirmed', () => {
+    const source = '<template><ElButton v-loading v-spin /></template>'
+    const blocked = migrate('src/Styles.vue', source)
+    expect(blocked.output).toBe(source)
+    expect(blocked.findings).toMatchObject([
+      { name: 'ElButton', fixable: false, reason: expect.stringContaining('--external-styles element-plus') },
+      { name: 'loading', fixable: false, reason: expect.stringContaining('resolver-injected styles') },
+      { name: 'spin', fixable: false, reason: expect.stringContaining('--external-styles ant-design-vue') },
+    ])
+    const allowed = migrate('src/Styles.vue', source, { externalStyles: ['element-plus', 'ant-design-vue'] })
+    expect(allowed.findings.every(finding => finding.fixable)).toBe(true)
+    expect(allowed.output).toContain("import { ElButton, ElLoadingDirective as vLoading } from 'element-plus'")
+    expect(allowed.output).toContain("import { vSpin } from 'ant-design-vue'")
+  })
+
+  test('guards package subpaths while preserving type-only findings and local overrides', () => {
+    const root = temporaryProject({
+      '.unimport-items.json': JSON.stringify([
+        { name: 'FormInstance', from: 'element-plus', type: true },
+        { name: 'ElMessage', from: './src/utils/message.ts' },
+        { name: 'ElNotice', from: 'element-plus/es/components/notification' },
+        { name: 'message', as: 'antMessage', from: 'ant-design-vue/es/message' },
+      ]),
+    })
+    const { output, findings } = migrate('src/Entry.ts', 'type Form = FormInstance\nElMessage(); ElNotice(); antMessage()', { root, alias: { '@': 'src' } })
+    expect(findings).toMatchObject([
+      { name: 'FormInstance', fixable: true }, { name: 'ElMessage', fixable: true },
+      { name: 'ElNotice', fixable: false }, { name: 'antMessage', fixable: false },
+    ])
+    expect(output).toContain("import type { FormInstance } from 'element-plus'")
+    expect(output).toContain("import { ElMessage } from '@/utils/message'")
+  })
+})
+
+test.each(['...localComponents', '[dynamicKey]: CustomBtn', 'get CustomBtn() { return Button }'])(
+  'does not mutate a dynamic Options API components registry with %s', component => {
+    const source = '<script>export default { components: { ' + component + ' } }</script>\n<template><ElButton /></template>'
+    const { output, findings } = migrate('src/Options.vue', source, elementPlusStyles)
+    expect(findings).toMatchObject([{ name: 'ElButton', fixable: false, reason: expect.stringMatching(/Options API components registry/) }])
+    expect(output).toBe(source)
+  },
+)

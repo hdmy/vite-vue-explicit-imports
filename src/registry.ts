@@ -1,10 +1,10 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { parseSync } from 'oxc-parser'
 import type { Node } from 'oxc-parser'
 import { walk } from 'oxc-walker'
 import { dirname, resolve } from 'pathe'
 import { globSync } from 'tinyglobby'
-import { Project } from './project'
+import { isFile, Project } from './project'
 
 export interface ImportEntry {
   local: string
@@ -24,6 +24,7 @@ export interface DirectiveEntry extends ImportEntry {
 }
 
 export interface Registry {
+  sources: { imports?: string; components?: string }
   imports: Map<string, ImportEntry>
   components: Map<string, ComponentEntry>
   directives: Map<string, DirectiveEntry>
@@ -57,9 +58,12 @@ function importType(node: Node | null | undefined): { from: string; exportName: 
 }
 
 function discovery(root: string, explicit: string | undefined, basename: string): string | undefined {
-  if (explicit !== undefined) return resolve(root, explicit)
+  if (explicit !== undefined) {
+    const file = resolve(root, explicit)
+    return isFile(file) ? file : undefined
+  }
   return [basename, `src/${basename}`, ...globSync(`src/*.${basename}`, { cwd: root }).sort()]
-    .map(file => resolve(root, file)).find(existsSync)
+    .map(file => resolve(root, file)).find(isFile)
 }
 
 interface DumpItem {
@@ -86,9 +90,45 @@ function readDump(file: string): DumpItem[] {
   })
 }
 
+export function assertRegistryReady(project: Project, registry: Registry): void {
+  const { modes, options, root } = project
+  if (modes.imports !== 'off') {
+    const selected = options.unimportItems ?? options.importsDts
+    const missing = selected !== undefined && !isFile(resolve(root, selected))
+    if (!registry.sources.imports || missing) {
+      throw new Error('Missing imports registry (.unimport-items.json or auto-imports.d.ts). '
+        + (missing ? 'Configured path: ' + resolve(root, selected) + '. ' : '')
+        + 'Generate it with unplugin-auto-import before scanning, set unimportItems/importsDts (CLI --unimport-items/--imports-dts), '
+        + "or disable imports via --category or mode: { imports: 'off' }.")
+    }
+  }
+  if ((modes.components !== 'off' || modes.directives !== 'off') && !registry.sources.components) {
+    throw new Error('Missing components registry (components.d.ts). '
+      + (options.componentsDts !== undefined ? 'Configured path: ' + resolve(root, options.componentsDts) + '. ' : '')
+      + 'Generate it with unplugin-vue-components before scanning, set componentsDts (CLI --components-dts), '
+      + 'or disable both components and directives via --category or mode.')
+  }
+}
+
+export function isRegistryFile(project: Project, file: string): boolean {
+  const { root, options, modes } = project
+  const matches = (path: string | undefined) => path !== undefined && file === resolve(root, path)
+  const conventional = (basename: string) => file === resolve(root, basename)
+    || (dirname(file) === resolve(root, 'src') && (file.endsWith('/' + basename) || file.endsWith('.' + basename)))
+  return (modes.imports !== 'off' && (matches(options.unimportItems) || matches(options.importsDts)
+    || file === resolve(root, '.unimport-items.json') || conventional('auto-imports.d.ts')))
+    || ((modes.components !== 'off' || modes.directives !== 'off')
+      && (matches(options.componentsDts) || conventional('components.d.ts')))
+}
+
+export function resolverStylePackage(entry: ImportEntry): string | undefined {
+  if (!entry.filePath) return ['element-plus', 'ant-design-vue'].find(pkg =>
+    entry.from === pkg || entry.from.startsWith(pkg + '/'))
+}
+
 export function loadRegistry(project: Project): Registry {
   const { root, options } = project
-  const registry: Registry = { imports: new Map(), components: new Map(), directives: new Map() }
+  const registry: Registry = { sources: {}, imports: new Map(), components: new Map(), directives: new Map() }
   const packages = { 'element-plus/es': 'element-plus', 'ant-design-vue/es': 'ant-design-vue', ...options.packageSpecifiers }
   const normalize = (file: string, local: string, from: string, exportName: string): ImportEntry => {
     const filePath = project.resolveLocal(from, dirname(file))
@@ -106,42 +146,48 @@ export function loadRegistry(project: Project): Registry {
     return result.program
   }
 
-  const dump = options.unimportItems !== undefined
-    ? resolve(root, options.unimportItems)
-    : resolve(root, '.unimport-items.json')
-  if (options.unimportItems !== undefined || existsSync(dump)) {
-    for (const item of readDump(dump)) {
-      if (!item.disabled) addImport(dump, item.as ?? item.name, item.from, item.name, item.type)
-    }
-  } else {
-    const file = discovery(root, options.importsDts, 'auto-imports.d.ts')
-    if (file) {
-      walk(parse(file), {
-        enter(node) {
-          if (node.type === 'TSModuleDeclaration' && !node.global) this.skip()
-          if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier') {
-            const ref = importType(node.id.typeAnnotation?.typeAnnotation)
-            if (ref) addImport(file, node.id.name, ref.from, ref.exportName)
-          }
-          if (node.type === 'TSTypeAliasDeclaration') {
-            const ref = importType(node.typeAnnotation)
-            if (ref) addImport(file, node.id.name, ref.from, ref.exportName, true)
-          }
-          if (node.type === 'ExportNamedDeclaration' && node.source) {
-            for (const spec of node.specifiers) {
-              if (node.exportKind !== 'type' && spec.exportKind !== 'type') continue
-              const local = staticName(spec.exported)
-              const imported = staticName(spec.local)
-              if (local && imported) addImport(file, local, node.source.value, imported, true)
+  if (project.modes.imports !== 'off') {
+    const dump = options.unimportItems !== undefined
+      ? resolve(root, options.unimportItems)
+      : resolve(root, '.unimport-items.json')
+    if (isFile(dump)) {
+      for (const item of readDump(dump)) {
+        if (!item.disabled) addImport(dump, item.as ?? item.name, item.from, item.name, item.type)
+      }
+      registry.sources.imports = dump
+    } else if (options.unimportItems === undefined) {
+      const file = discovery(root, options.importsDts, 'auto-imports.d.ts')
+      if (file) {
+        registry.sources.imports = file
+        walk(parse(file), {
+          enter(node) {
+            if (node.type === 'TSModuleDeclaration' && !node.global) this.skip()
+            if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier') {
+              const ref = importType(node.id.typeAnnotation?.typeAnnotation)
+              if (ref) addImport(file, node.id.name, ref.from, ref.exportName)
             }
-          }
-        },
-      })
+            if (node.type === 'TSTypeAliasDeclaration') {
+              const ref = importType(node.typeAnnotation)
+              if (ref) addImport(file, node.id.name, ref.from, ref.exportName, true)
+            }
+            if (node.type === 'ExportNamedDeclaration' && node.source) {
+              for (const spec of node.specifiers) {
+                if (node.exportKind !== 'type' && spec.exportKind !== 'type') continue
+                const local = staticName(spec.exported)
+                const imported = staticName(spec.local)
+                if (local && imported) addImport(file, local, node.source.value, imported, true)
+              }
+            }
+          },
+        })
+      }
     }
   }
 
+  if (project.modes.components === 'off' && project.modes.directives === 'off') return registry
   const file = discovery(root, options.componentsDts, 'components.d.ts')
   if (!file) return registry
+  registry.sources.components = file
   walk(parse(file), {
     enter(node) {
       if (node.type === 'TSModuleDeclaration' && !node.global
